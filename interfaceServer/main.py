@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import logging
 import os
+import json
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-from supabase import Client, create_client
+import firebase_admin
+from firebase_admin import credentials, firestore
 
 from scraper import get_appnames_by_packageNames
 
@@ -23,11 +25,13 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
 # 주요 환경 변수들: 값이 없으면 기본값을 사용한다.
-SUPABASE_TABLE = os.getenv("SUPABASE_APPS_TABLE", "apps")
+FIRESTORE_COLLECTION = os.getenv("FIRESTORE_APPS_COLLECTION", "apps")
+FIREBASE_SERVICE_ACCOUNT = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID")
 
 @dataclass
 class AppRecord:
-    """Represents a row from the Supabase `apps` table."""
+    """Represents a row from the Firestore `apps` collection."""
 
     id: str
     app_name: str
@@ -37,25 +41,30 @@ class AppRecord:
 
 
 
-def init_supabase_client() -> Client:
-    url = os.getenv("SUPABASE_URL")
-    key = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_ANON_KEY")
+def init_firestore_client() -> firestore.Client:
+    """Initialize Firebase Admin SDK from JSON and return a Firestore client."""
+    if not firebase_admin._apps:  # type: ignore[attr-defined]
+        cred_obj = None
+        if FIREBASE_SERVICE_ACCOUNT:
+            try:
+                if FIREBASE_SERVICE_ACCOUNT.strip().startswith("{"):
+                    cred_obj = credentials.Certificate(json.loads(FIREBASE_SERVICE_ACCOUNT))
+                else:
+                    cred_obj = credentials.Certificate(FIREBASE_SERVICE_ACCOUNT)
+            except Exception as exc:
+                raise RuntimeError(f"Failed to load FIREBASE_SERVICE_ACCOUNT_JSON: {exc}") from exc
+        else:
+            cred_obj = credentials.ApplicationDefault()
+        firebase_admin.initialize_app(cred_obj, {"projectId": FIREBASE_PROJECT_ID} if FIREBASE_PROJECT_ID else None)
+        logger.info("Firebase app initialized.")
+    return firestore.client()
 
-    if not url or not key:
-        raise RuntimeError(
-            "Supabase credentials are not configured. "
-            "Please set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY (or SUPABASE_ANON_KEY)."
-        )
 
-    logger.info("Supabase client initialised.")
-    return create_client(url, key)
-
-
-def get_app_records_batch(client: Client, package_names: List[str]) -> Dict[str, AppRecord]:
-    """Supabase에서 여러 패키지명을 한 번에 조회한다.
+def get_app_records_batch(db: firestore.Client, package_names: List[str]) -> Dict[str, AppRecord]:
+    """Firestore에서 여러 패키지명을 한 번에 조회한다.
     
     Args:
-        client: Supabase 클라이언트
+        db: Firestore 클라이언트
         package_names: 조회할 패키지명 리스트
     
     Returns:
@@ -65,40 +74,34 @@ def get_app_records_batch(client: Client, package_names: List[str]) -> Dict[str,
         return {}
 
     try:
-        response = client.table(SUPABASE_TABLE).select(
-            "id,app_name,description,category,category_ko"
-        ).in_("id", package_names).execute()
-
-        if getattr(response, "error", None):
-            raise RuntimeError(f"Supabase batch lookup failed: {response.error}")
-
-        data = response.data or []
+        doc_refs = [db.collection(FIRESTORE_COLLECTION).document(pkg) for pkg in package_names]
+        snapshots = db.get_all(doc_refs)
         records_map: Dict[str, AppRecord] = {}
 
-        for row in data:
-            try:
-                record = AppRecord(
-                    id=row["id"],
-                    app_name=row.get("app_name") or row["id"],
-                    description=row["description"],
-                    category=row.get("category"),
-                    category_ko=row.get("category_ko"),
-                )
-                records_map[record.id] = record
-            except KeyError as exc:
-                logger.warning("Supabase row missing required columns: %s", exc)
+        for snap in snapshots:
+            if not snap.exists:
                 continue
+            row = snap.to_dict() or {}
+            row_id = snap.id
+            record = AppRecord(
+                id=row.get("id", row_id),
+                app_name=row.get("app_name") or row_id,
+                description=row.get("description") or "",
+                category=row.get("category"),
+                category_ko=row.get("category_ko"),
+            )
+            records_map[record.id] = record
 
-        logger.info("Fetched %d app records from Supabase (requested %d).", len(records_map), len(package_names))
+        logger.info("Fetched %d app records from Firestore (requested %d).", len(records_map), len(package_names))
         return records_map
 
     except Exception as exc:
         logger.exception("Error during batch lookup")
-        raise RuntimeError(f"Failed to fetch app records from Supabase: {exc}") from exc
+        raise RuntimeError(f"Failed to fetch app records from Firestore: {exc}") from exc
 
 
-def upsert_app_record(client: Client, record: AppRecord) -> None:
-    """카테고리 결과를 Supabase에 저장(Upsert)한다."""
+def upsert_app_record(db: firestore.Client, record: AppRecord) -> None:
+    """카테고리 결과를 Firestore에 저장(Upsert)한다."""
     payload = {
         "id": record.id,
         "app_name": record.app_name,
@@ -107,15 +110,11 @@ def upsert_app_record(client: Client, record: AppRecord) -> None:
         "category_ko": record.category_ko,
     }
 
-    response = client.table(SUPABASE_TABLE).upsert(payload, on_conflict="id").execute()
-
-    if getattr(response, "error", None):
-        raise RuntimeError(f"Failed to upsert record into Supabase: {response.error}")
-
-    logger.info("Record for %s upserted into Supabase.", record.id)
+    db.collection(FIRESTORE_COLLECTION).document(record.id).set(payload, merge=True)
+    logger.info("Record for %s upserted into Firestore.", record.id)
 
 
-supabase_client = init_supabase_client()
+firestore_client = init_firestore_client()
 
 app = Flask(__name__)
 app.config["JSON_AS_ASCII"] = False  # 한글 등 유니코드 문자를 이스케이프하지 않음
@@ -130,36 +129,6 @@ def health_check() -> Any:
 
 @app.post("/classify")
 def classify() -> Any:
-    """여러 앱의 패키지명을 받아 카테고리를 분류하고 Supabase에 저장한다.
-    
-    요청 형식:
-    {
-        "apps": [
-            {
-                "package_name": "com.example.app1"
-            },
-            {
-                "package_name": "com.example.app2"
-            },
-            ...
-        ]
-    }
-    
-    응답 형식:
-    {
-        "results": [
-            {
-                "package_name": "...",
-                "app_name": "...",
-                "description": "...",
-                "category": "...",
-                "category_ko": "...",
-                "source": "supabase" | "scraper" | "error"
-            },
-            ...
-        ]
-    }
-    """
     payload: Dict[str, Any] = request.get_json(silent=True) or {}
     apps = payload.get("apps", [])
 
@@ -197,11 +166,11 @@ def classify() -> Any:
     if not valid_package_names:
         return jsonify({"results": results}), 200
 
-    # 1단계: Supabase에서 모든 package_name을 한 번에 배치 조회
+    # 1단계: Firestore에서 모든 package_name을 한 번에 배치 조회
     try:
-        existing_records_map = get_app_records_batch(supabase_client, valid_package_names)
+        existing_records_map = get_app_records_batch(firestore_client, valid_package_names)
     except Exception as exc:  # pylint: disable=broad-except
-        logger.exception("Error during batch Supabase lookup")
+        logger.exception("Error during batch Firestore lookup")
         # 배치 조회 실패 시 모든 항목을 에러로 처리
         for package_name in valid_package_names:
             results.append(
@@ -212,7 +181,7 @@ def classify() -> Any:
                     "category": None,
                     "category_ko": None,
                     "source": "error",
-                    "error": f"Supabase lookup failed: {str(exc)}",
+                    "error": f"Firestore lookup failed: {str(exc)}",
                 }
             )
         return jsonify({"results": results}), 200
@@ -225,17 +194,17 @@ def classify() -> Any:
         existing = existing_records_map.get(package_name)
 
         if existing and existing.category:
-            logger.info("Category for %s found in Supabase.", package_name)
+            logger.info("Category for %s found in Firestore.", package_name)
             temp_results[package_name] = {
                 "package_name": package_name,
                 "app_name": existing.app_name,
                 "description": existing.description,
                 "category": existing.category,
                 "category_ko": existing.category_ko,
-                "source": "supabase",
+                "source": "firebase",
             }
         else:
-            # Supabase에 없거나 카테고리가 없는 경우 scraper 사용
+            # Firestore에 없거나 카테고리가 없는 경우 scraper 사용
             package_names_to_scrape.append(package_name)
 
     # 2단계: Scraper로 조회 (조회되지 않은 것들만)
@@ -293,7 +262,7 @@ def classify() -> Any:
                     category_ko=None,  # scraper에서 category_ko는 제공하지 않음
                 )
 
-                upsert_app_record(supabase_client, record)
+                upsert_app_record(firestore_client, record)
 
                 temp_results[package_name] = {
                     "package_name": package_name,
